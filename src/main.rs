@@ -1,133 +1,135 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
-use std::{sync::{Arc}};
 use enigo::*;
-use eframe::egui;
+use eframe::{Frame,egui::{self,RichText}};
 use tokio::time::Duration;
-use std::{cell::RefCell, rc::Rc};
-use tray_icon::{TrayIconBuilder, menu::{MenuEvent,Menu,AboutMetadata, MenuItem, PredefinedMenuItem},TrayIconEvent};
+use once_cell::sync::{Lazy,OnceCell}; // 1.5.2
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+static RUNNER: tokio::sync::OnceCell<tokio::task::JoinHandle<()>> = tokio::sync::OnceCell::const_new();
+static ENIGO: Lazy<tokio::sync::Mutex<Enigo>> = Lazy::new(|| tokio::sync::Mutex::new(Enigo::new()));
+static RUNNING: AtomicBool = AtomicBool::new(false);
+static RERUN: AtomicBool = AtomicBool::new(false);
+static SHOW_CONFIRMATION_DIALOG: AtomicBool = AtomicBool::new(false);
+static ALLOWED_TO_CLOSE: AtomicBool =  AtomicBool::new(false);
+static minimized: AtomicBool =  AtomicBool::new(false);
+static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap());
+static RUNTIMERUNNING: AtomicBool = AtomicBool::new(false);
 
-fn load_icon(path: &std::path::Path) -> tray_icon::Icon {
-    let (icon_rgba, icon_width, icon_height) = {
-        let image = image::open(path)
-            .expect("Failed to open icon path")
-            .into_rgba8();
-        let (width, height) = image.dimensions();
-        let rgba = image.into_raw();
-        (rgba, width, height)
-    };
-    tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to open icon")
-}
-
-struct App {
-    runner: Option<tokio::task::JoinHandle<()>>,
-    running: Arc<tokio::sync::RwLock<bool>>,
-    enigo: Arc<tokio::sync::Mutex<Enigo>>,
-}
+struct App;
 
 impl App {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            runner: None,
-            running: Arc::new(tokio::sync::RwLock::new(false)),
-            enigo: Arc::new(tokio::sync::Mutex::new(Enigo::new())),
-        }
+        Self {}
     }
-    fn start(&mut self) {
-        let running = Arc::clone(&self.running);
-        let enigo = Arc::clone(&self.enigo);
-        self.runner = Some(tokio::spawn(async move {
-            {
-                let mut running = running.write().await;
-                *running = true;
-            }
-            let mouse_future = tokio::spawn(Self::move_mouse(Arc::clone(&enigo), Arc::clone(&running)));
-            let key_future = tokio::spawn(Self::press_key(Arc::clone(&enigo), Arc::clone(&running)));
-            let _ = tokio::try_join!(mouse_future, key_future);
-        }));
-    }
-
-    fn stop(&mut self) {
-        let running = Arc::clone(&self.running);
-        if let Some(runner) = self.runner.take() {
-            tokio::spawn(async move {
-                {
-                    let mut running = running.write().await;
-                    *running = false;
-                }
-                let _ = runner.await;
-            });
-        }
-    }
-    async fn move_mouse(enigo: Arc<tokio::sync::Mutex<Enigo>>, running: Arc<tokio::sync::RwLock<bool>>) {
-        while *running.read().await {
-            println!("move");
-            {
-                let mut enigo = enigo.lock().await;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    enigo.mouse_move_relative(1,1);
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            {
-                let mut enigo = enigo.lock().await;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    enigo.mouse_move_relative(-1,-1);
-                }));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    }
-    async fn press_key(enigo: Arc<tokio::sync::Mutex<Enigo>>, running: Arc<tokio::sync::RwLock<bool>>) {
-        while *running.read().await {
-            println!("click");
-            {
-                let mut enigo = enigo.lock().await;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    enigo.key_click(Key::F15);
-                }));
-            }
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
-    }
-    
     
 }
+async fn stop() {
+    if let Some(handle) = RUNNER.get() {
+        handle.abort();
+    }
+    println!("Stopped");
+}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            println!("tray event: {event:?}");
-        };
-        if let Ok(event) = MenuEvent::receiver().try_recv() {
-            println!("menu event: {:?}", event);
+
+
+async fn start() {
+    RUNNER.set(RUNTIME.spawn(async move {
+        tokio::select! {
+            _ = move_mouse() => {},
+            _ = press_key() => {},
         }
+    }));
+}
+
+async fn move_mouse() {
+    while RUNNING.load(Ordering::Relaxed) {
+        println!("move");
+        {
+            let mut enigo = ENIGO.lock().await;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enigo.mouse_move_relative(1,1);
+            }));
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        {
+            let mut enigo = ENIGO.lock().await;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enigo.mouse_move_relative(-1,-1);
+            }));
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn press_key() {
+    while RUNNING.load(Ordering::Relaxed) {
+        println!("click");
+        {
+            let mut enigo = ENIGO.lock().await;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enigo.key_click(Key::F15);
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+    }
+}
+impl eframe::App for App {
+    fn on_close_event(&mut self) -> bool {
+        SHOW_CONFIRMATION_DIALOG.compare_exchange(false,true ,Ordering::Acquire, Ordering::Relaxed);
+        ALLOWED_TO_CLOSE.load(Ordering::Relaxed)
+    }
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Each frame:
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center),|ui| {
                 if ui.button(egui::RichText::new("Start").size(20.0)).clicked() {
-                    self.start();
+                    if RUNNING.compare_exchange(false,true,Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        RUNTIME.spawn(async {
+                            start().await;
+                        });
+                    }
                 }
                 if ui.button(egui::RichText::new("Stop").size(20.0)).clicked() {
-                    self.stop();
+                    if RUNNING.compare_exchange(true,false,Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        RUNTIME.spawn(async {
+                            stop().await;
+                        });
+                    }
                 }
             });
         });
+        if SHOW_CONFIRMATION_DIALOG.load(Ordering::Relaxed) {
+            // Show confirmation dialog:
+            egui::Window::new(RichText::new("Do you want to quit?").size(12.0))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Cancel").size(12.0)).clicked() {
+                            SHOW_CONFIRMATION_DIALOG.compare_exchange(true,false ,Ordering::Acquire, Ordering::Relaxed);
+                        }
+
+                        if ui.button(RichText::new("Yes!").size(12.0)).clicked() {
+                            ALLOWED_TO_CLOSE.compare_exchange(false,true ,Ordering::Acquire, Ordering::Relaxed);
+                            frame.close();
+                        }
+                    });
+                });
+        };
     }
 }
 
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/shake.png");
-    println!("{}",path);
-    let icon = load_icon(std::path::Path::new(path));
-    let mut _tray_icon = Rc::new(RefCell::new(None));
-    let tray_c = _tray_icon.clone();
+fn main() {
+    // Initialize the static variables
+    RUNTIME.enter();
     let native_options = eframe::NativeOptions {
         active: true,
         centered: true,
-        icon_data: Some(eframe::IconData::try_from_png_bytes(include_bytes!("shake.png")).unwrap()),
         always_on_top: false,
         maximized: false,
         decorated: true,
@@ -141,33 +143,12 @@ async fn main() {
         vsync: true,
         ..Default::default()
     };
-    let tray_menu = Menu::new();
-    let quit_i = MenuItem::new("Quit", true, None);
-    tray_menu.append_items(&[
-        &PredefinedMenuItem::about(
-            None,
-            Some(AboutMetadata {
-                name: Some("tao".to_string()),
-                copyright: Some("Copyright SonALAsense".to_string()),
-                ..Default::default()
-            }),
-        ),
-        &PredefinedMenuItem::separator(),
-        &quit_i,
-    ]);
+
+    
     eframe::run_native(
         "Mouse Shacker",
         native_options,
         Box::new(move |cc| {
-            #[cfg(not(target_os = "linux"))]
-            {
-                tray_c
-                    .borrow_mut()
-                    .replace(TrayIconBuilder::new()
-                        .with_tooltip("Mouse Shacker!")
-                        .with_menu(Box::new(tray_menu))
-                        .with_icon(icon).build().unwrap());
-            }
             Box::new(App::new(cc))
         }),
     );

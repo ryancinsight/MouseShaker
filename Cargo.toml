@@ -9,10 +9,11 @@ edition = "2021"
 eframe = { version = "*", features = ["persistence"] }
 egui_extras = { version = "*", features = ["all_loaders"] }
 enigo = "0.1.3"
-snmalloc-rs = { version = "*", features = ["usecxx17", "build_cc"] }
+snmalloc-rs = { version = "*", features = ["usecxx17", "build_cc","native-cpu"] }
 tokio = { version = "1.34.0", features = ["full"] }
-tray-icon = "0.10.0"
 image = { version = "*", features = ["jpeg_rayon", "png"] } # Add the types you want support for
+once_cell = "1.18.0"
+
 
 [profile.release]
 lto = "thin"

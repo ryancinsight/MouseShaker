@@ -25,7 +25,7 @@ impl App {
     }
     
 }
-async fn stop() {
+fn stop() {
     if let Some(handle) = RUNNER.get() {
         handle.abort();
     }
@@ -34,7 +34,7 @@ async fn stop() {
 
 
 
-async fn start() {
+fn start() {
     RUNNER.set(RUNTIME.spawn(async move {
         tokio::select! {
             _ = move_mouse() => {},
@@ -89,16 +89,12 @@ impl eframe::App for App {
             ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center),|ui| {
                 if ui.button(egui::RichText::new("Start").size(20.0)).clicked() {
                     if RUNNING.compare_exchange(false,true,Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                        RUNTIME.spawn(async {
-                            start().await;
-                        });
+                            start();
                     }
                 }
                 if ui.button(egui::RichText::new("Stop").size(20.0)).clicked() {
                     if RUNNING.compare_exchange(true,false,Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                        RUNTIME.spawn(async {
-                            stop().await;
-                        });
+                            stop();
                     }
                 }
             });

@@ -1,127 +1,199 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-use atomic_once_cell::AtomicLazy as Lazy;
-use atomic_once_cell::AtomicOnceCell;
-use eframe::egui::{self};
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+use eframe::egui;
 use enigo::*;
-use async_std::task; // Import async-std task
-use futures::FutureExt; // Import FutureExt for fuse
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::task;
+use crossbeam_channel::{bounded, Sender};
+use tracing::{info, debug, error};
 
-static RUNNER: AtomicOnceCell<async_std::task::JoinHandle<()>> = AtomicOnceCell::new();
-static ENIGO: Lazy<async_std::sync::Mutex<Enigo>> = Lazy::new(App::create_enigo);
+const MOUSE_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+const KEY_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false); // New flag for stopping
 
-struct App;
+fn setup_logging() {
+    #[cfg(debug_assertions)]
+    {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_target(false)
+            .with_thread_ids(true)
+            .with_line_number(true)
+            .with_file(true)
+            .init();
+    }
+}
+
+struct AppState {
+    enigo: Arc<Mutex<Enigo>>,
+    stop_sender: Option<Sender<()>>,
+    core_ids: Vec<core_affinity::CoreId>,
+}
+
+struct App {
+    state: AppState,
+}
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> App {
-        App {}
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(debug_assertions)]
+        info!("Initializing App");
+        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        Self {
+            state: AppState {
+                enigo: Arc::new(Mutex::new(Enigo::new(&Settings::default()).unwrap())),
+                stop_sender: None,
+                core_ids,
+            },
+        }
     }
 
-    fn create_enigo() -> async_std::sync::Mutex<Enigo> {
-        async_std::sync::Mutex::new(Enigo::new(&Settings::default()).unwrap())
-    }
-}
+    #[inline(always)]
+    async fn move_mouse(enigo: Arc<Mutex<Enigo>>, stop_rx: crossbeam_channel::Receiver<()>) {
+        while RUNNING.load(Ordering::Acquire) {
+            if stop_rx.try_recv().is_ok() {
+                #[cfg(debug_assertions)]
+                info!("Stopping mouse movement loop");
+                break;
+            }
 
-async fn move_mouse() {
-    while RUNNING.load(Ordering::Relaxed) {
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            break; // Exit if stop is requested
-        }
-        {
-            let mut enigo_lock = ENIGO.lock().await; // Lock once
-            if let Err(e) = enigo_lock.move_mouse(1, 1, Coordinate::Rel) {
-                println!("Error moving mouse: {:?}", e);
+            {
+                let mut enigo = enigo.lock();
+                #[cfg(debug_assertions)]
+                debug!("Moving mouse +1,+1");
+                let _ = enigo.move_mouse(1, 1, Coordinate::Rel);
+            } // MutexGuard automatically drops here
+            
+            spin_sleep::sleep(MOUSE_SLEEP_DURATION);
+            
+            {
+                let mut enigo = enigo.lock();
+                #[cfg(debug_assertions)]
+                debug!("Moving mouse -1,-1");
+                let _ = enigo.move_mouse(-1, -1, Coordinate::Rel);
             }
         }
-        async_std::task::sleep(std::time::Duration::from_secs(5)).await; // Sleep outside the lock
-        {
-            let mut enigo_lock = ENIGO.lock().await; // Lock once
-            if let Err(e) = enigo_lock.move_mouse(-1, -1, Coordinate::Rel) {
-                println!("Error moving mouse back: {:?}", e);
-            }
-        }
-        println!("Mouse movement completed.");
     }
-}
 
-async fn press_key() {
-    while RUNNING.load(Ordering::Relaxed) {
-        if STOP_REQUESTED.load(Ordering::Relaxed) {
-            break; // Exit if stop is requested
-        }
-        {
-            let mut enigo_lock = ENIGO.lock().await; // Lock once
-            if let Err(e) = enigo_lock.key(Key::F15, Direction::Click) {
-                println!("Error pressing key: {:?}", e);
+    #[inline(always)]
+    async fn press_key(enigo: Arc<Mutex<Enigo>>, stop_rx: crossbeam_channel::Receiver<()>) {
+        #[cfg(debug_assertions)]
+        info!("Starting key press task");
+        
+        while RUNNING.load(Ordering::Acquire) {
+            if stop_rx.try_recv().is_ok() {
+                #[cfg(debug_assertions)]
+                info!("Stopping key press task");
+                break;
             }
+
+            {
+                let mut enigo = enigo.lock();
+                #[cfg(debug_assertions)]
+                debug!("Attempting to press F15 key");
+                
+                match enigo.key(Key::F15, Direction::Click) {
+                    Ok(_) => {
+                        #[cfg(debug_assertions)]
+                        debug!("Successfully pressed F15 key");
+                    },
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        error!("Failed to press F15 key: {:?}", e);
+                    }
+                }
+            }
+            
+            #[cfg(debug_assertions)]
+            debug!("Sleeping for {} seconds", KEY_SLEEP_DURATION.as_secs());
+            
+            spin_sleep::sleep(KEY_SLEEP_DURATION);
         }
-        async_std::task::sleep(std::time::Duration::from_secs(10)).await; // Sleep outside the lock
-        println!("Key press completed.");
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Each frame:
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.with_layout(
-                egui::Layout::top_down_justified(egui::Align::Center),
-                |ui| {
-                    if ui.button(egui::RichText::new("Start").size(20.0)).clicked()
-                        && RUNNING
-                            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        STOP_REQUESTED.store(false, Ordering::Relaxed); // Reset stop request
-                        let _ = RUNNER.set(task::spawn(async {
-                            futures::select! {
-                                _ = move_mouse().fuse() => {},
-                                _ = press_key().fuse() => {},
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                let is_running = RUNNING.load(Ordering::Acquire);
+                let button_text = if is_running { "Stop" } else { "Start" };
+                
+                if ui.button(egui::RichText::new(button_text).size(20.0)).clicked() {
+                    if is_running {
+                        if RUNNING.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                            #[cfg(debug_assertions)]
+                            info!("Stopping automation");
+                            if let Some(sender) = self.state.stop_sender.take() {
+                                let _ = sender.send(());
                             }
-                        }));
+                        }
+                    } else {
+                        if RUNNING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                            #[cfg(debug_assertions)]
+                            info!("Starting automation tasks");
+                            let enigo = self.state.enigo.clone();
+                            let enigo2 = self.state.enigo.clone();
+                            let (stop_tx, stop_rx1) = bounded(1);
+                            let stop_rx2 = stop_rx1.clone();
+                            
+                            self.state.stop_sender = Some(stop_tx);
+
+                            let core_ids1 = self.state.core_ids.clone();
+                            let core_ids2 = self.state.core_ids.clone();
+                            
+                            // Spawn mouse movement task
+                            task::spawn(async move {
+                                if !core_ids1.is_empty() {
+                                    core_affinity::set_for_current(core_ids1[0]);
+                                }
+                                App::move_mouse(enigo, stop_rx1).await;
+                            });
+
+                            // Spawn key press task separately
+                            task::spawn(async move {
+                                if core_ids2.len() > 1 {
+                                    core_affinity::set_for_current(core_ids2[1]);
+                                }
+                                App::press_key(enigo2, stop_rx2).await;
+                            });
+                        }
                     }
-                    if ui.button(egui::RichText::new("Stop").size(20.0)).clicked()
-                        && RUNNING
-                            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        STOP_REQUESTED.store(true, Ordering::Relaxed); // Request to stop
-                        println!("Stopped");
-                    }
-                },
-            );
+                }
+            });
         });
     }
 }
 
 fn main() {
-    // Initialize the static variables
-    let _ = async_std::task::block_on(async {
-        let view = eframe::egui::viewport::ViewportBuilder {
-            resizable: Some(true),
-            transparent: Some(false),
-            drag_and_drop: Some(false),
-            decorations: Some(true),
-            active: Some(true),
-            close_button: Some(true),
-            mouse_passthrough: Some(false),
-            maximize_button: Some(false),
-            ..Default::default()
-        };
-        let options = eframe::NativeOptions {
-            viewport: view,
-            centered: true,
-            multisampling: 8,
-            vsync: true,
-            ..Default::default()
-        };
+    setup_logging();
+    #[cfg(debug_assertions)]
+    info!("Application starting");
+    
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
 
-        let _ = eframe::run_native(
-            "Mouse Shacker",
-            options,
-            Box::new(|cc| Ok(Box::new(App::new(cc)))),
-        );
-    });
+    let options = eframe::NativeOptions {
+        centered: true,
+        multisampling: 0,
+        vsync: true,
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Mouse Shaker",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    ).unwrap();
 }

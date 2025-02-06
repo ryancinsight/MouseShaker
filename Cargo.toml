@@ -8,13 +8,20 @@ edition = "2021"
 [dependencies]
 eframe = { version = "*", features = ["persistence"] }
 enigo = "*"
-async-std = "*"
-atomic_once_cell = "*"
-futures = "*"
-
+tokio = { version = "*", features = ["full"] }
+parking_lot = "*"
+spin_sleep = "*"
+crossbeam-channel = "*"
+core_affinity = "*"
+mimalloc = { version = "*", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
-lto = "on"
+lto = "fat"
 strip = true
 debug = false
 codegen-units = 1
+panic = "abort"
+opt-level = 3
+incremental = false

@@ -1,21 +1,25 @@
 [package]
-name = "windowon"
+name = "mouse-shaker"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Keeps your system awake by simulating mouse and keyboard activity"
 
 [dependencies]
-eframe = { version = "*", features = ["persistence"] }
-enigo = "*"
-tokio = { version = "*", features = ["full"] }
-parking_lot = "*"
-spin_sleep = "*"
-crossbeam-channel = "*"
-core_affinity = "*"
-mimalloc = { version = "*", default-features = false }
+eframe = "0.29"
+enigo = "0.3"
+crossbeam-channel = "0.5"
+core_affinity = "0.8"
+rpmalloc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+tray-icon = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+winresource = "0.1"
 
 [profile.release]
 lto = "fat"

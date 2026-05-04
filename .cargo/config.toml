@@ -7,3 +7,8 @@ rustflags = ["-C","link-arg=-fvisibility=hidden", "-C", "debuginfo=0","-C", "tar
 
 [target.x86_64-unknown-linux-musl]
 linker="lld"
+
+# Tell cc-rs to use clang when building C dependencies (mimalloc, rpmalloc, etc.)
+# on this windows-gnu/clang toolchain instead of falling back to gcc.exe.
+[env]
+CC = "clang"
